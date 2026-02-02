@@ -1,20 +1,22 @@
 #import 
-#import xlwings as xw 
+import xlwings as xw 
 import os
 import numpy as np 
 import matplotlib.pyplot as plt
+from scipy.stats import norm, expon, uniform
 
 wb=xw.Book.caller()
 ws=wb.sheets["RBS_Simulation"]
+ws1=wb.sheets["Visualisation"]
 
 # --- Define states ---
 Operational = "Operational"
-Failure_with_spare = "Failure_with_spare"
-Failure_without_spare = "Failure_without_spare"
-Repair_without_spare = "Repair_without_spare"
+Repair_immediate = "Repair_immediate"
+Lead_time = "Lead_time"
+Repair = "Repair"
 
-np.random.seed(42) #set seed for reproducibility
-def run_rbs_simulation(qty, mbtf, mttr, Lead_time, Simulation_Time):
+#np.random.seed(42) #set seed for reproducibility
+def run_rbs_simulation(qty, mbtf, mttr, lead_time, Simulation_Time):
     
     #list to track metrics
     timeline=[0] #timepoints, array contain 0 (start time), eventual timepoints will be appended here
@@ -41,13 +43,20 @@ def run_rbs_simulation(qty, mbtf, mttr, Lead_time, Simulation_Time):
         failure_time=np.random.exponential(mbtf) #generate time to next failure
         next_time=current_time+failure_time #calculate next event time
         #current_time+=failure_time #advance time by failure time
-        if next_time>Simulation_Time: #if we have exceeded simulation time
-            break #exit loop
+        if next_time>=Simulation_Time:
+            # Ensure the simulation timeline always ends exactly at Simulation_Time
+            if timeline[-1] < Simulation_Time:
+                timeline.append(Simulation_Time)
+                # Extend the last status to the end
+                status.append(Repair_immediate if qty > 0 else Repair)
+                qty-=1
+                qty_list.append(qty)  # last known quantity
+            break
         current_time+=failure_time #advance time by failure time
         timeline.append(current_time) #append current time to timeline
         if qty>0: #if there are spare parts
             failures_with_spares+=1 #increment failures with spares
-            status.append(Failure_with_spare) #append status
+            status.append(Repair_immediate) #append status
             qty-=1 #reduce spare parts by 1
             #timeline.append(current_time) #append current time to timeline
             qty_list.append(qty) #append current qty to qty_list
@@ -56,10 +65,13 @@ def run_rbs_simulation(qty, mbtf, mttr, Lead_time, Simulation_Time):
             downtime_with_spares+=repair_time #add repair time to downtime with spares
             next_time+=repair_time #advance time by repair time
             if next_time>Simulation_Time: #if we have exceeded simulation time
-                break #exit loop
+                if timeline[-1]<Simulation_Time:
+                    timeline.append(Simulation_Time)
+                    status.append(Operational)
+                    qty_list.append(qty)
             current_time+=repair_time #advance time by repair time
             timeline.append(current_time) #append current time to timeline
-            #status.append(Repair_with_spare) #append status
+            #status.append(Repair_immediate) #append status
             #qty-=1 #reduce spare parts by 1
             #timeline.append(current_time) #append current time to timeline
             status.append(Operational) #append status
@@ -67,17 +79,20 @@ def run_rbs_simulation(qty, mbtf, mttr, Lead_time, Simulation_Time):
         else: #if no spare parts
             failures_without_spares+=1 #increment failures without spares
             #timeline.append(current_time) #append current time to timeline
-            status.append(Failure_without_spare) #append status
+            status.append(Lead_time) #append status
             qty_list.append(qty) #append current qty to qty_list
             #if current_time>Simulation_Time: #if we have exceeded simulation time
                 #break #exit loop
-            downtime_without_spares+=Lead_time #add lead time
-            next_time+=Lead_time #advance time by lead time
+            downtime_without_spares+=lead_time #add lead time
+            next_time+=lead_time #advance time by lead time
             if next_time>Simulation_Time: #if we have exceeded simulation time
-                break #exit loop
-            current_time+=Lead_time #advance time by lead time
+                if timeline[-1]<Simulation_Time:
+                    timeline.append(Simulation_Time)
+                    status.append(Repair)
+                    qty_list.append(qty)
+            current_time+=lead_time #advance time by lead time
             timeline.append(current_time) #append current time to timeline
-            status.append(Repair_without_spare) #append status
+            status.append(Repair) #append status
             qty_list.append(qty) #append current qty to qty_list
             #if current_time>Simulation_Time: #if we have exceeded simulation time
                 #break #exit loop
@@ -85,7 +100,10 @@ def run_rbs_simulation(qty, mbtf, mttr, Lead_time, Simulation_Time):
             downtime_without_spares+=repair_time #add repair time to downtime without spares
             next_time+=repair_time #advance time by repair time
             if next_time>Simulation_Time: #if we have exceeded simulation time
-                break #exit loop
+                if timeline[-1]<Simulation_Time:
+                    timeline.append(Simulation_Time)
+                    status.append(Operational)
+                    qty_list.append(qty)
             current_time+=repair_time #advance time by repair time
             timeline.append(current_time) #append current time to timeline
             status.append(Operational) #append status
@@ -93,13 +111,13 @@ def run_rbs_simulation(qty, mbtf, mttr, Lead_time, Simulation_Time):
             #if current_time>Simulation_Time: #if we have exceeded simulation time
                 #break #exit loop
                 #qty remains 0 as no spares are available
-            
+                
     total_downtime=downtime_with_spares+downtime_without_spares #calculate total downtime
     uptime=current_time-total_downtime #calculate time without failures
-    availability = (uptime)/current_time
+    availability = uptime / current_time if current_time > 0 else 0.0 #calculate availability
     #ideally, we cant forsee damand(failure) so we determine fill rate instead, where every simulation will be classified to either availability meet demand or not
     #we then calculate the amount of times it meet demand over total simulations. This gives us P(K<=s), P(Demand<=spare)
-    fill_rate = (failures_with_spares)/(failures_with_spares+failures_without_spares) 
+    fill_rate = failures_with_spares / (failures_with_spares + failures_without_spares) if (failures_with_spares + failures_without_spares) > 0 else 0.0
     stockout_probability = 1 - fill_rate
     readiness = fill_rate*availability
     return total_downtime, uptime, downtime_without_spares, downtime_with_spares, availability, timeline, status, qty_list, fill_rate, stockout_probability, readiness
@@ -109,9 +127,9 @@ def plot_simple_gantt(timeline, status, qty):
 
     STATE_COLORS = {
         Operational: "green",
-        Failure_with_spare: "red",
-        Failure_without_spare: "brown",
-        Repair_without_spare: "orange"
+        Repair_immediate: "blue",
+        Lead_time: "red",
+        Repair: "orange"
     }   
     fig, ax = plt.subplots(figsize=(12,2))
     y = 0 #single bar at y=0
@@ -125,8 +143,8 @@ def plot_simple_gantt(timeline, status, qty):
     ax.set_yticks([y])
     ax.set_yticklabels(["System"])
     ax.set_xlabel("Time")
-    ax.set_title("System State Gantt Chart")
-
+    ax.set_title(f"System State Gantt Chart for Qty {qty}")
+    
     # Legend
     handles = [plt.Rectangle((0,0),1,1,color=color) for color in STATE_COLORS.values()]
     labels = STATE_COLORS.keys()
@@ -139,13 +157,12 @@ def plot_simple_gantt(timeline, status, qty):
     plt.close(fig)
 
     # Insert image into Excel
-    col_start = 'L'  # Starting column for images
-    row=2 + qty_values.index(qty)  # Row based on quantity index
-    ws.pictures.add(img_path, name=f"Gantt_Qty{qty}", update=True,
+    col_start = 'A'  # Starting column for images
+    row=2 + 6*(qty_values.index(qty)) #index based on quantity index
+    ws1.pictures.add(img_path, name=f"Gantt_Qty{qty}", update=True,
                     left=ws.range(f'{col_start}{row}').left,
                     top=ws.range(f'{col_start}{row}').top,
                     width=500, height=80)
-    
 
 #monte carlo simulation for each spare quantity value
 def multiple_simulations_per_qty(qty_values, num_simulations):
@@ -161,19 +178,19 @@ def multiple_simulations_per_qty(qty_values, num_simulations):
     stockout_probability_results=[]
     readiness_results=[]
     for row,q in enumerate(qty_values,start=2): #start from row 2 in excel
-        total_downtime, uptime, downtime_without_spares, downtime_with_spares, availability, timeline, status, qty_list, fill_rate, stockout_probability, readiness = run_rbs_simulation(q, mbtf, mttr, Lead_time, Simulation_Time)
+        total_downtime, uptime, downtime_without_spares, downtime_with_spares, availability, timeline, status, qty_list, fill_rate, stockout_probability, readiness = run_rbs_simulation(q, mbtf, mttr, lead_time, Simulation_Time)
         plot_simple_gantt(timeline, status,q) #plot gantt chart for each spare quantity
-        #metrics 
-        print("=== Simulation Outputs ===")
-        print(f"Total time machine was operational: {uptime:.2f}")
-        print(f"Total downtime when spares were 0: {downtime_without_spares:.2f}")
-        print(f"Total downtime with spares: {downtime_with_spares:.2f}")
-        print(f"Overall availability: {availability:.2%}")
-        #write outputs to excel
-        ws.range(f'G{row}').value = uptime
-        ws.range(f'H{row}').value = downtime_without_spares
-        ws.range(f'I{row}').value = downtime_with_spares
-        ws.range(f'J{row}').value = availability 
+        # #metrics 
+        # print("=== Simulation Outputs ===")
+        # print(f"Total time machine was operational: {uptime:.2f}")
+        # print(f"Total downtime when spares were 0: {downtime_without_spares:.2f}")
+        # print(f"Total downtime with spares: {downtime_with_spares:.2f}")
+        # print(f"Overall availability: {availability:.2%}")
+        # #write outputs to excel
+        # ws.range(f'G{row}').value = uptime
+        # ws.range(f'H{row}').value = downtime_without_spares
+        # ws.range(f'I{row}').value = downtime_with_spares
+        # ws.range(f'J{row}').value = availability 
         
         total_downtime_avg=[]
         uptime_avg=[]
@@ -188,7 +205,7 @@ def multiple_simulations_per_qty(qty_values, num_simulations):
         readiness_avg=[]
             
         for i in range(num_simulations):
-            total_downtime, uptime, downtime_without_spares, downtime_with_spares, availability, timeline, status, qty_list, fill_rate, stockout_probability, readiness = run_rbs_simulation(q, mbtf, mttr, Lead_time, Simulation_Time)
+            total_downtime, uptime, downtime_without_spares, downtime_with_spares, availability, timeline, status, qty_list, fill_rate, stockout_probability, readiness = run_rbs_simulation(q, mbtf, mttr, lead_time, Simulation_Time)
             
             total_downtime_avg.append(total_downtime)
             uptime_avg.append(uptime)
@@ -205,35 +222,71 @@ def multiple_simulations_per_qty(qty_values, num_simulations):
         print(f"Average downtime with spares: {np.mean(downtime_with_spares_avg):.2f}")
         print(f"Average availability: {np.mean(availability_avg):.2%}")
         #write outputs to excel
-        ws.range(f'G{row}').value = np.mean(uptime_avg)
-        ws.range(f'H{row}').value = np.mean(downtime_without_spares_avg)
-        ws.range(f'I{row}').value = np.mean(downtime_with_spares_avg)
-        ws.range(f'J{row}').value = np.mean(availability_avg)
+        ws.range(f'H1').value = "Avg Uptime"
+        ws.range(f'H{row}').value = np.mean(uptime_avg)
+        ws.range(f'I1').value = "Avg Downtime without Spares"
+        ws.range(f'I{row}').value = np.mean(downtime_without_spares_avg)
+        ws.range(f'J1').value = "Avg Downtime with Spares"
+        ws.range(f'J{row}').value = np.mean(downtime_with_spares_avg)
+        ws.range(f'K1').value = "Avg Availability"
+        ws.range(f'K{row}').value = np.mean(availability_avg)
+        ws.range(f'L1').value = "Avg Fill Rate"
+        ws.range(f'L{row}').value = np.mean(fill_rate_avg)
+        ws.range(f'M1').value = "Avg Stockout Probability"
+        ws.range(f'M{row}').value = np.mean(stockout_probability_avg)
+        ws.range(f'N1').value = "Avg Readiness"
+        ws.range(f'N{row}').value = np.mean(readiness_avg)
+        ws.range('H:N').autofit()
         
-            
-            
-        total_downtime_results.append(np.mean(total_downtime_avg))
-        uptime_results.append(np.mean(uptime_avg))
-        downtime_without_spares_results.append(np.mean(downtime_without_spares_avg))
-        downtime_with_spares_results.append(np.mean(downtime_with_spares_avg))
-        availability_results.append(np.mean(availability_avg))
-        fill_rate_results.append(np.mean(fill_rate_avg))
-        stockout_probability_results.append(np.mean(stockout_probability_avg))
-        readiness_results.append(np.mean(readiness_avg))
-    print(total_downtime_results, uptime_results, downtime_without_spares_results, downtime_with_spares_results, availability_results, fill_rate_results, stockout_probability_results, readiness_results)
-    return total_downtime_results, uptime_results, downtime_without_spares_results, downtime_with_spares_results, availability_results, fill_rate_results, stockout_probability_results, readiness_results
+    qty_range = ws.range('B2').expand('down') #read quantity range from excel
+    qty_value=qty_range.value
+    headers = ws.range("1:1").value
+
+    def col(header):
+        return headers.index(header) + 1
+
+    offset_cols = col("Avg Readiness") - col("Initial Quantity of Spare parts")
+    readiness_range = qty_range.offset(0, offset_cols)
+    readiness_values = readiness_range.value
     
+    pmf_of_readiness(readiness_values, qty_value)
+        
+def pmf_of_readiness(readiness, qty_values):
 
+        fig, ax = plt.subplots(figsize=(7.5, 3.5))
+        ax.step(qty_values, readiness, where="post")
+        ax.set_xlabel("Quantity")
+        ax.set_ylabel("Readiness probability")
+        ax.set_ylim(0,1)
+        ax.set_yticks([0, 0.2, 0.4, 0.6, 0.8, 1])
+        ax.set_xticks([i for i in range(1,len(qty_values)+1)])
+        ax.set_title("CDF of Readiness")
+        ax.grid(True)   
+        fig.tight_layout()
+        img_path = os.path.join(os.getcwd(), f"CDF_Readiness.png")
+        fig.savefig(img_path, dpi=150)
+        plt.close(fig)
 
-
+        ws1.pictures.add(
+                img_path,
+                name=f"PMF_Readiness",
+                update=True,
+                left=ws1.range(f'L1').left,
+                top=ws1.range(f'L1').top,
+                width=520,
+                height=260,
+        )
+        
 #read values from excel tables, simulation based on user inputs
-qty=ws.range('B1').value.expand('down').value #read spare quantity from excel, expand down to read multiple values
+qty=ws.range('B2').expand('down').value #read spare quantity from excel, expand down to read multiple values
+if not isinstance(qty, list):
+    qty = [qty]
 qty_values=[q for q in qty if q is not None] #filter out None values
-mbtf=ws.range('C1').value
-mttr=ws.range('D1').value
-Lead_time=ws.range('E1').value
-Simulation_Time=ws.range('F1').value
-num_simulations=ws.range('G1').value
+mbtf=int(ws.range('C2').value) 
+mttr=int(ws.range('D2').value)
+lead_time=int(ws.range('E2').value)
+Simulation_Time=int(ws.range('F2').value)
+num_simulations=int(ws.range('G2').value)
 
 #call function to run multiple simulations per spare quantity
 multiple_simulations_per_qty(qty_values, num_simulations)
@@ -247,7 +300,7 @@ multiple_simulations_per_qty(qty_values, num_simulations)
 #     availability_results = []
 #     for q in qty_values:
 #         for i in range(num_simulations):
-#             _, _, _, _, availability, _, _, _, _, _ = run_rbs_simulation(q, mbtf, mttr, Lead_time, Simulation_Time)
+#             _, _, _, _, availability, _, _, _, _, _ = run_rbs_simulation(q, mbtf, mttr, lead_time, Simulation_Time)
 #             availability_results.append(availability)
 #             average_availability = np.mean(availability_results)
 #     return average_availability
@@ -260,7 +313,7 @@ multiple_simulations_per_qty(qty_values, num_simulations)
 
 # plt.figure(figsize=(12, 4))
 # plt.step(timeline_user_in, status_user_in, where='post', linewidth=2)
-# plt.yticks([0, 1, 2, 3, 4], ["Failure_with_spare", "Repair_with_spare", "Operational", "Failure_without_spare", "Repair_no_spare"])
+# plt.yticks([0, 1, 2, immediate = "Repair_immediate", "Operational", "Failure_without_spare", "Repair_no_spare"])
 # plt.xlabel("Time")
 # plt.ylabel("Machine Status")
 # plt.title("RBS Simulation Timeline")
@@ -274,7 +327,7 @@ multiple_simulations_per_qty(qty_values, num_simulations)
 
 
 # for spare_qty in spare_parts_array:
-#     uptime, downtime_without_spares, downtime_with_spares, availability = run_rbs_simulation(spare_qty,(mbtf),(mttr), Lead_time, Simulation_Time)
+#     uptime, downtime_without_spares, downtime_with_spares, availability = run_rbs_simulation(spare_qty,(mbtf),(mttr), lead_time, Simulation_Time)
 #     availability_results.append(availability)
 
 # # Plot availability vs spare parts
